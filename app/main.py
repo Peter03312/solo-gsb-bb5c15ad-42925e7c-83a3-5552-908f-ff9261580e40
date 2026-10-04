@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from . import ledger
 from .db import init_db
 from .ledger import ApiError
-from .schemas import CloseIn, RefundIn, SaleIn, WorkIn
+from .schemas import CloseIn, RefundIn, SaleIn, SettlementIn, WorkIn
 
 
 @asynccontextmanager
@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.0.0",
-    description="阶梯版税计提、作者分账、退款冲销与关账报表",
+    version="1.1.0",
+    description="阶梯版税计提、作者分账、退款冲销、关账报表与结算付款",
     lifespan=lifespan,
 )
 
@@ -33,7 +33,7 @@ async def api_error_handler(request, exc: ApiError):
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.0.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.1.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -113,3 +113,27 @@ def list_closes():
 @app.get("/closes/{close_id}", summary="查询关账报表（不可改）")
 def get_close(close_id: int):
     return ledger.get_close(close_id)
+
+
+# ---------------------------------------------------------------- 结算付款
+
+
+@app.post("/settlements", status_code=201, summary="结算付款：确认作者实际付款")
+def create_settlement(payload: SettlementIn, response: Response):
+    body, created = ledger.create_settlement(payload)
+    if not created:  # 同付款编号同内容重试 → 返回原结算结果
+        response.status_code = 200
+    return body
+
+
+@app.get("/settlements/{payment_id}", summary="查询结算付款记录")
+def get_settlement(payment_id: str):
+    return ledger.get_settlement(payment_id)
+
+
+@app.get(
+    "/authors/{author_id}/settlement",
+    summary="作者结算查询：分批应计/已付/负余额/可付/付款记录",
+)
+def get_author_settlement(author_id: str):
+    return ledger.author_settlement(author_id)

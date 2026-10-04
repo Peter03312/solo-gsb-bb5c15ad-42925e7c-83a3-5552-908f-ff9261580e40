@@ -8,6 +8,11 @@
   同一销售的累计退款册数不得超过原册数；
 - 关账汇总上一批次之后到本次提交前的全部流水，生成逐笔明细与作者合计的快照报表，
   报表落库后不可修改；关账后补录的旧业务流水按入账序号自然进入下一批次；
+- 结算付款：以「作者编号 + 当前最新关账批次编号 + 付款编号 + 支付金额（分）」提交。
+  作者应计额 = 截至该批次全部不可改关账快照中该作者净额之和；已付额 = 其全部已确认付款之和；
+  可付额 = max(应计额 - 已付额, 0)；支付金额须为正且不超过可付额。
+  关账后退款若使应计额低于已付额，差额记为待抵扣负余额（不改写旧报表与旧付款），
+  后续关账的正额先抵扣负余额，剩余部分才进入可付额；
 - 同号同内容重试返回原结果，同号异内容拒绝（409）。
 """
 from __future__ import annotations
@@ -19,7 +24,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from .db import LOCK, get_conn
-from .schemas import RefundIn, SaleIn, WorkIn
+from .schemas import RefundIn, SaleIn, SettlementIn, WorkIn
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal(100)
@@ -618,4 +623,170 @@ def list_closes() -> dict:
                 }
                 for r in rows
             ]
+        }
+
+
+# ---------------------------------------------------------------- 结算付款
+
+
+def _settlement_fingerprint(p: SettlementIn) -> str:
+    return _fingerprint(
+        {
+            "payment_id": p.payment_id,
+            "author_id": p.author_id,
+            "close_id": p.close_id,
+            "amount_cents": p.amount_cents,
+        }
+    )
+
+
+def _author_exists(conn: sqlite3.Connection, author_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM work_authors WHERE author_id=? LIMIT 1", (author_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _accrued_cents(conn: sqlite3.Connection, author_id: str, close_id: int) -> int:
+    """作者应计额：截至指定批次全部不可改关账快照中该作者净额之和。"""
+    return conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS c FROM close_author_totals"
+        " WHERE author_id=? AND close_id<=?",
+        (author_id, close_id),
+    ).fetchone()["c"]
+
+
+def _paid_cents(conn: sqlite3.Connection, author_id: str) -> int:
+    """作者已付额：全部已确认付款之和。"""
+    return conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS c FROM payments WHERE author_id=?",
+        (author_id,),
+    ).fetchone()["c"]
+
+
+def create_settlement(p: SettlementIn) -> tuple[dict, bool]:
+    """结算付款：确认作者实际付款。
+
+    校验顺序：付款编号幂等（同号同内容直接返回原结果，即使后续又关账）→
+    作者/批次存在 → 批次为当前最新 → 金额不超过可付额。
+    校验与写入在同一事务中完成，并发结算不会超付。
+    """
+    fp = _settlement_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT fingerprint, payload FROM payments WHERE payment_id=?",
+            (p.payment_id,),
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fp:
+                raise _conflict(f"付款 {p.payment_id} 已存在且内容不一致")
+            return json.loads(row["payload"]), False
+        if not _author_exists(conn, p.author_id):
+            raise _not_found(f"作者 {p.author_id} 不存在")
+        if (
+            conn.execute(
+                "SELECT 1 FROM closes WHERE close_id=?", (p.close_id,)
+            ).fetchone()
+            is None
+        ):
+            raise _not_found(f"关账批次 {p.close_id} 不存在")
+        latest = conn.execute("SELECT MAX(close_id) AS c FROM closes").fetchone()["c"]
+        if p.close_id != latest:
+            raise _conflict(
+                f"关账批次 {p.close_id} 并非当前最新批次（当前最新为 {latest}）"
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            accrued = _accrued_cents(conn, p.author_id, p.close_id)
+            paid_before = _paid_cents(conn, p.author_id)
+            payable = max(accrued - paid_before, 0)
+            if p.amount_cents > payable:
+                raise _bad_request(
+                    f"支付金额({p.amount_cents})超过可付额({payable})"
+                )
+            paid = paid_before + p.amount_cents
+            body = {
+                "payment_id": p.payment_id,
+                "author_id": p.author_id,
+                "close_id": p.close_id,
+                "amount_cents": p.amount_cents,
+                "accrued_cents": accrued,  # 截至该批次的应计额
+                "paid_cents": paid,  # 含本笔的累计已付
+                "payable_cents": max(accrued - paid, 0),  # 支付后剩余可付
+                "negative_balance_cents": max(paid - accrued, 0),  # 支付后待抵扣负余额
+                "created_at": _utcnow(),
+            }
+            conn.execute(
+                "INSERT INTO payments(payment_id, author_id, close_id, amount_cents,"
+                " fingerprint, payload, created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    p.payment_id,
+                    p.author_id,
+                    p.close_id,
+                    p.amount_cents,
+                    fp,
+                    json.dumps(body, ensure_ascii=False),
+                    body["created_at"],
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return body, True
+
+
+def get_settlement(payment_id: str) -> dict:
+    with LOCK:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT payload FROM payments WHERE payment_id=?", (payment_id,)
+        ).fetchone()
+        if row is None:
+            raise _not_found(f"付款 {payment_id} 不存在")
+        return json.loads(row["payload"])
+
+
+def author_settlement(author_id: str) -> dict:
+    """作者结算查询：分批应计、已付额、待抵扣负余额、可付额及付款记录。"""
+    with LOCK:
+        conn = get_conn()
+        if not _author_exists(conn, author_id):
+            raise _not_found(f"作者 {author_id} 不存在")
+        latest = conn.execute("SELECT MAX(close_id) AS c FROM closes").fetchone()["c"]
+        batches = conn.execute(
+            "SELECT close_id, amount_cents FROM close_author_totals"
+            " WHERE author_id=? ORDER BY close_id",
+            (author_id,),
+        ).fetchall()
+        pays = conn.execute(
+            "SELECT payment_id, close_id, amount_cents, created_at FROM payments"
+            " WHERE author_id=? ORDER BY rowid",
+            (author_id,),
+        ).fetchall()
+        accrued = sum(b["amount_cents"] for b in batches)
+        paid = sum(p["amount_cents"] for p in pays)
+        return {
+            "author_id": author_id,
+            "latest_close_id": latest,
+            "accrued_cents": accrued,
+            "paid_cents": paid,
+            "payable_cents": max(accrued - paid, 0),
+            "negative_balance_cents": max(paid - accrued, 0),
+            "batches": [
+                {"close_id": b["close_id"], "amount_cents": b["amount_cents"]}
+                for b in batches
+            ],
+            "payments": [
+                {
+                    "payment_id": p["payment_id"],
+                    "close_id": p["close_id"],
+                    "amount_cents": p["amount_cents"],
+                    "created_at": p["created_at"],
+                }
+                for p in pays
+            ],
         }

@@ -80,3 +80,15 @@ class CloseIn(BaseModel):
     """关账请求。request_id 可选：携带时作为幂等键，同键重试返回原报表。"""
 
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class SettlementIn(BaseModel):
+    """结算付款请求。payment_id 为幂等键：同号同内容重试返回原结算结果，同号异内容拒绝。
+
+    close_id 必须为当前最新关账批次；amount_cents 须为正且不超过作者可付额。
+    """
+
+    author_id: str = Field(min_length=1, max_length=128)
+    close_id: int = Field(ge=1)
+    payment_id: str = Field(min_length=1, max_length=128)
+    amount_cents: int = Field(gt=0, description="支付金额（分），须为正且不超过可付额")

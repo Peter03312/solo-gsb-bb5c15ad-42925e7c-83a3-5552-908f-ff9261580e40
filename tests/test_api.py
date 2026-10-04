@@ -252,6 +252,137 @@ def test_close_empty_batch(client):
     assert body["net_royalty_cents"] == 0
 
 
+# ---------------------------------------------------------------- 结算付款
+
+
+def settle(client, author_id="A1", close_id=1, payment_id="PAY-1", amount=1):
+    return client.post(
+        "/settlements",
+        json={
+            "author_id": author_id,
+            "close_id": close_id,
+            "payment_id": payment_id,
+            "amount_cents": amount,
+        },
+    )
+
+
+def test_settlement_flow_and_author_query(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)  # A1 应计 128160，A2 应计 85440
+    client.post("/closes")
+
+    r = settle(client, amount=100000)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["payment_id"] == "PAY-1"
+    assert body["author_id"] == "A1" and body["close_id"] == 1
+    assert body["accrued_cents"] == 128160  # 截至该批次应计额
+    assert body["paid_cents"] == 100000  # 含本笔的累计已付
+    assert body["payable_cents"] == 28160  # 支付后剩余可付
+    assert body["negative_balance_cents"] == 0
+
+    # 按作者查询：分批应计/已付/负余额/可付/付款记录
+    q = client.get("/authors/A1/settlement").json()
+    assert q["latest_close_id"] == 1
+    assert q["accrued_cents"] == 128160
+    assert q["paid_cents"] == 100000
+    assert q["payable_cents"] == 28160
+    assert q["negative_balance_cents"] == 0
+    assert q["batches"] == [{"close_id": 1, "amount_cents": 128160}]
+    assert [(p["payment_id"], p["amount_cents"]) for p in q["payments"]] == [
+        ("PAY-1", 100000)
+    ]
+
+    # 付清余款后可付额归零，再付 1 分也拒绝
+    r = settle(client, payment_id="PAY-2", amount=28160)
+    assert r.status_code == 201 and r.json()["payable_cents"] == 0
+    assert settle(client, payment_id="PAY-3", amount=1).status_code == 400
+    q = client.get("/authors/A1/settlement").json()
+    assert q["paid_cents"] == 128160 and q["payable_cents"] == 0
+
+
+def test_settlement_validation(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)
+    client.post("/closes")
+    # 作者不存在 / 批次不存在
+    assert settle(client, author_id="NOPE", amount=1).status_code == 404
+    assert settle(client, close_id=99, amount=1).status_code == 404
+    # 支付金额须为正
+    assert settle(client, amount=0).status_code == 422
+    assert settle(client, amount=-5).status_code == 422
+    # 超过可付额
+    assert settle(client, amount=128161).status_code == 400
+    # 失败的结算不占用付款编号：修正金额后可重新提交
+    assert settle(client, amount=128160).status_code == 201
+    # 批次并非当前最新：再关一批后，对旧批次付款拒绝
+    make_sale(client, "S2", copies=1)
+    client.post("/closes")
+    assert settle(client, payment_id="PAY-9", close_id=1, amount=100).status_code == 409
+
+
+def test_settlement_idempotent_replay_survives_later_closes(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)
+    client.post("/closes")
+    r1 = settle(client, amount=1000)
+    assert r1.status_code == 201
+    # 后续又入账并关账
+    make_sale(client, "S2", copies=10)
+    client.post("/closes")
+    # 同付款编号同内容重试 → 返回原结算结果（即使批次已非最新）
+    r2 = settle(client, amount=1000)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    # 同号异内容 → 冲突
+    assert settle(client, amount=1001).status_code == 409
+    assert settle(client, close_id=2, amount=1000).status_code == 409
+    # 按付款编号查询结果一致
+    assert client.get("/settlements/PAY-1").json() == r1.json()
+    assert client.get("/settlements/NOPE").status_code == 404
+    assert client.get("/authors/NOPE/settlement").status_code == 404
+
+
+def test_settlement_negative_balance_offset(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)  # A1 应计 128160
+    client.post("/closes")
+    # 全额付款
+    r = settle(client, amount=128160)
+    assert r.status_code == 201 and r.json()["payable_cents"] == 0
+
+    # 关账后退款 100 册：第二批 A1 净额 -16020，应计低于已付 → 待抵扣负余额
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 100})
+    client.post("/closes")
+    q = client.get("/authors/A1/settlement").json()
+    assert q["batches"] == [
+        {"close_id": 1, "amount_cents": 128160},
+        {"close_id": 2, "amount_cents": -16020},
+    ]
+    assert q["accrued_cents"] == 112140
+    assert q["paid_cents"] == 128160
+    assert q["payable_cents"] == 0
+    assert q["negative_balance_cents"] == 16020
+    # 可付额为 0，任何正额支付都拒绝
+    assert settle(client, payment_id="PAY-2", close_id=2, amount=1).status_code == 400
+
+    # 后续关账正额（A1 +32040）先抵扣负余额，剩余 16020 进入可付
+    make_sale(client, "S2", copies=200)
+    client.post("/closes")
+    q = client.get("/authors/A1/settlement").json()
+    assert q["accrued_cents"] == 144180
+    assert q["payable_cents"] == 16020
+    assert q["negative_balance_cents"] == 0
+    r = settle(client, payment_id="PAY-2", close_id=3, amount=16020)
+    assert r.status_code == 201 and r.json()["payable_cents"] == 0
+    # 旧报表与旧付款不改写
+    assert client.get("/closes/1").json()["author_totals"] == [
+        {"author_id": "A1", "amount_cents": 128160},
+        {"author_id": "A2", "amount_cents": 85440},
+    ]
+    assert client.get("/settlements/PAY-1").json()["amount_cents"] == 128160
+
+
 # ---------------------------------------------------------------- 并发
 
 
@@ -288,3 +419,22 @@ def test_concurrent_sales_and_close(client):
     assert c2["entry_seq_from"] == c1["entry_seq_to"] + 1
     ids = [l["sale_id"] for l in c1["lines"]] + [l["sale_id"] for l in c2["lines"]]
     assert sorted(ids) == sorted(f"CS{i}" for i in range(n))
+
+
+def test_concurrent_settlements_never_overpay(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)  # A1 可付 128160
+    client.post("/closes")
+
+    def pay(i):
+        return settle(client, payment_id=f"CP{i}", amount=20000)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(pay, range(10)))
+    ok = [r for r in results if r.status_code == 201]
+    rejected = [r for r in results if r.status_code == 400]
+    # 6×20000=120000 ≤ 128160 < 7×20000：恰好 6 笔成功，其余因超额拒绝
+    assert len(ok) == 6 and len(rejected) == 4
+    q = client.get("/authors/A1/settlement").json()
+    assert q["paid_cents"] == 120000  # 已付不超过应计，并发未超付
+    assert q["payable_cents"] == 8160

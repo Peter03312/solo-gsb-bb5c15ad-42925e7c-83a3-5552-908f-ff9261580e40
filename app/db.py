@@ -128,6 +128,18 @@ CREATE TABLE IF NOT EXISTS close_author_totals (
     amount_cents INTEGER NOT NULL,
     PRIMARY KEY (close_id, author_id)
 );
+
+-- 结算付款：财务确认的作者实际付款（payment_id 为幂等键，结算结果快照落库后只读）
+CREATE TABLE IF NOT EXISTS payments (
+    payment_id   TEXT PRIMARY KEY,
+    author_id    TEXT NOT NULL,
+    close_id     INTEGER NOT NULL REFERENCES closes(close_id),
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    fingerprint  TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payments_author ON payments(author_id);
 """
 
 

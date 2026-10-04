@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表
+# 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表 → 结算付款 → 作者结算查询
 # 用法：BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -53,3 +53,21 @@ curl -s -X POST "$BASE/sales" -H 'Content-Type: application/json' -d '{
 echo "== 6. 再次关账并查看两批报表 =="
 curl -s -X POST "$BASE/closes" | fmt
 curl -s "$BASE/closes" | fmt
+
+echo "== 7. 结算付款：对当前最新批次确认作者 A1 实际付款 =="
+LATEST_CLOSE=$(curl -s "$BASE/closes" | python3 -c "import sys, json; print(json.load(sys.stdin)['closes'][-1]['close_id'])")
+curl -s -X POST "$BASE/settlements" -H 'Content-Type: application/json' -d "{
+  \"author_id\": \"A1\",
+  \"close_id\": ${LATEST_CLOSE},
+  \"payment_id\": \"PAY-2026-09-A1\",
+  \"amount_cents\": 100000
+}" | fmt
+
+echo "== 8. 同号同内容重试（返回原结算结果）与按作者查询结算 =="
+curl -s -X POST "$BASE/settlements" -H 'Content-Type: application/json' -d "{
+  \"author_id\": \"A1\",
+  \"close_id\": ${LATEST_CLOSE},
+  \"payment_id\": \"PAY-2026-09-A1\",
+  \"amount_cents\": 100000
+}" | fmt
+curl -s "$BASE/authors/A1/settlement" | fmt
