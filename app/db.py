@@ -128,6 +128,21 @@ CREATE TABLE IF NOT EXISTS close_author_totals (
     amount_cents INTEGER NOT NULL,
     PRIMARY KEY (close_id, author_id)
 );
+
+-- 作者付款结算：仅可针对当前最新关账批次提交；
+-- accrued/paid_before/payable 为提交时刻的计算快照，幂等重放时原样返回，不随后续关账变化
+CREATE TABLE IF NOT EXISTS payments (
+    payment_id        TEXT PRIMARY KEY,
+    author_id         TEXT NOT NULL,
+    close_id          INTEGER NOT NULL REFERENCES closes(close_id),
+    amount_cents      INTEGER NOT NULL CHECK (amount_cents > 0),
+    accrued_cents     INTEGER NOT NULL,
+    paid_before_cents INTEGER NOT NULL,
+    payable_cents     INTEGER NOT NULL,
+    fingerprint       TEXT NOT NULL,
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payments_author ON payments(author_id);
 """
 
 

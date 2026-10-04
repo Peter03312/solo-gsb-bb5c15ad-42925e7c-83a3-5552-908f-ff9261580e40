@@ -50,8 +50,10 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 - **作者分账**：对整笔计提金额，各作者按分成比例**先向下取整到分**，剩余分按**作者编号顺序**（纯数字编号按数值，其余按字典序）依次补 1 分。
 - **退款**：从原销售**最后一册**起按原每册计提冲回（含分账），**不回退累计销量**；同一销售的累计退款册数不得超过原册数（超出返回 400）。
 - **关账**：汇总上次关账之后到本次提交前的全部流水（按入账序号），生成**逐笔明细 + 作者合计**的快照报表，落库后**不可修改**（仅提供只读接口）；关账后补录的旧业务流水自然进入下一批次。
-- **幂等**：作品 / 销售 / 退款以唯一编号为准——同号同内容重试返回原结果（HTTP 200），同号异内容拒绝（HTTP 409）；关账可携带 `request_id` 作为幂等键。
-- **并发**：所有入账与关账写操作在进程内串行化并在单事务中提交（`BEGIN IMMEDIATE`），批次归属由**数据库提交顺序**决定。
+- **付款结算（关账后）**：以作者编号、**当前最新关账批次**编号、付款编号、支付金额（分）提交。应计额 = 截至该批次全部**不可改关账快照**中该作者净额之和；已付额 = 该作者全部已确认付款之和；可付额 = `max(应计额 − 已付额, 0)`。支付金额必须为正且不超过可付额；作者/批次不存在返回 404，批次不是当前最新返回 409。
+- **负余额（待抵扣）**：关账后退款若使应计额低于已付额，差额记为作者的待抵扣负余额，**后续关账的正额先抵扣**，旧报表与旧付款均不改写；负余额未清零时可付额为 0，不能付款。
+- **幂等**：作品 / 销售 / 退款 / 付款以唯一编号为准——同号同内容重试返回原结果（HTTP 200），同号异内容拒绝（HTTP 409）；付款的同号同内容重试**即使之后又有关账也返回原结算结果**（响应为提交时刻的快照）。关账可携带 `request_id` 作为幂等键。
+- **并发**：所有入账、关账与结算写操作在进程内串行化并在单事务中提交（`BEGIN IMMEDIATE`），批次归属由**数据库提交顺序**决定，并发结算不会超付。
 
 ## API 一览
 
@@ -67,6 +69,9 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 | POST | `/closes` | 关账，生成不可改报表（可选 `request_id` 幂等键） |
 | GET | `/closes` | 关账批次列表 |
 | GET | `/closes/{close_id}` | 查询关账报表 |
+| POST | `/payments` | 提交作者付款结算（仅当前最新关账批次） |
+| GET | `/payments/{payment_id}` | 查询单笔付款结算 |
+| GET | `/authors/{author_id}/settlement` | 作者结算总览：分批应计、已付、负余额、可付、付款记录 |
 
 金额单位：响应中 `*_cents` 字段均为**分**；`net_price` 为元（字符串原样返回，避免浮点误差）。
 
@@ -105,7 +110,71 @@ curl -X POST http://localhost:8000/closes -H 'Content-Type: application/json' -d
 # 5. 查看报表与批次列表
 curl http://localhost:8000/closes/1
 curl http://localhost:8000/closes
+
+# 6. 财务确认作者实际付款（close_id 必须是当前最新批次）
+curl -X POST http://localhost:8000/payments -H 'Content-Type: application/json' -d '{
+  "payment_id": "PAY-2026-09-A1",
+  "author_id": "A1",
+  "close_id": 2,
+  "amount_cents": 100000
+}'
+
+# 7. 同付款编号同内容重试 → 原样返回；按作者查询结算总览
+curl -X POST http://localhost:8000/payments -H 'Content-Type: application/json' -d '{
+  "payment_id": "PAY-2026-09-A1", "author_id": "A1", "close_id": 2, "amount_cents": 100000
+}'
+curl http://localhost:8000/authors/A1/settlement
+curl http://localhost:8000/payments/PAY-2026-09-A1
 ```
+
+付款结算响应示例：
+
+```json
+{
+  "payment_id": "PAY-2026-09-A1",
+  "author_id": "A1",
+  "close_id": 2,
+  "amount_cents": 100000,
+  "accrued_cents": 152790,
+  "paid_before_cents": 0,
+  "payable_cents": 152790,
+  "paid_after_cents": 100000,
+  "negative_balance_cents": 0,
+  "created_at": "2026-10-04T12:00:00+00:00"
+}
+```
+
+作者结算总览响应（`GET /authors/{author_id}/settlement`）：
+
+```json
+{
+  "author_id": "A1",
+  "latest_close_id": 2,
+  "accrued_cents": 152790,
+  "paid_cents": 100000,
+  "negative_balance_cents": 0,
+  "payable_cents": 52790,
+  "batches": [
+    {"close_id": 1, "batch_net_cents": 152190, "accrued_cents": 152190, "created_at": "..."},
+    {"close_id": 2, "batch_net_cents": 600,    "accrued_cents": 152790, "created_at": "..."}
+  ],
+  "payments": [
+    {"payment_id": "PAY-2026-09-A1", "close_id": 2, "amount_cents": 100000,
+     "accrued_cents": 152790, "paid_before_cents": 0, "payable_cents": 152790, "created_at": "..."}
+  ]
+}
+```
+
+字段说明：`batches[].batch_net_cents` 为该批次快照中作者净额（退款可为负），`accrued_cents` 为截至该批次的累计应计；顶层 `negative_balance_cents = max(paid − accrued, 0)`，`payable_cents = max(accrued − paid, 0)`。
+
+### 错误码（付款结算）
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 支付金额超过可付额（含可付额为 0 / 存在待抵扣负余额） |
+| 404 | 作者或关账批次不存在 |
+| 409 | 批次不是当前最新；或同付款编号异内容重试 |
+| 422 | 请求体校验失败（如 `amount_cents ≤ 0`） |
 
 响应示例（销售入账，节选）：
 
@@ -135,7 +204,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、并发入账与关账。
+覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算。
 
 ## 项目结构
 

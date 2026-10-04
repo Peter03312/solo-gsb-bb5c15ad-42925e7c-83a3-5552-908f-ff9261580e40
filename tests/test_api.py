@@ -288,3 +288,167 @@ def test_concurrent_sales_and_close(client):
     assert c2["entry_seq_from"] == c1["entry_seq_to"] + 1
     ids = [l["sale_id"] for l in c1["lines"]] + [l["sale_id"] for l in c2["lines"]]
     assert sorted(ids) == sorted(f"CS{i}" for i in range(n))
+
+
+# ---------------------------------------------------------------- 付款结算
+
+
+def pay(client, payment_id, author_id, close_id, amount):
+    return client.post(
+        "/payments",
+        json={
+            "payment_id": payment_id,
+            "author_id": author_id,
+            "close_id": close_id,
+            "amount_cents": amount,
+        },
+    )
+
+
+def test_payment_happy_path_and_replay(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)  # A1 应计 128160 分
+    r = client.post("/closes", json={"request_id": "C1"})
+    close_id = r.json()["close_id"]
+
+    s = client.get("/authors/A1/settlement").json()
+    assert s["latest_close_id"] == close_id
+    assert s["accrued_cents"] == 128160 and s["paid_cents"] == 0
+    assert s["payable_cents"] == 128160 and s["negative_balance_cents"] == 0
+    assert s["batches"] == [
+        {"close_id": close_id, "batch_net_cents": 128160, "accrued_cents": 128160,
+         "created_at": s["batches"][0]["created_at"]}
+    ]
+
+    r = pay(client, "P1", "A1", close_id, 100000)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["close_id"] == close_id and body["amount_cents"] == 100000
+    assert body["accrued_cents"] == 128160
+    assert body["paid_before_cents"] == 0 and body["payable_cents"] == 128160
+    assert body["paid_after_cents"] == 100000 and body["negative_balance_cents"] == 0
+
+    # 同付款编号同内容重试 → 原结算结果
+    r2 = pay(client, "P1", "A1", close_id, 100000)
+    assert r2.status_code == 200 and r2.json() == body
+    # 同号异内容（金额不同）→ 409
+    assert pay(client, "P1", "A1", close_id, 100001).status_code == 409
+
+    # 结清剩余可付额 28160
+    r = pay(client, "P2", "A1", close_id, 28160)
+    assert r.status_code == 201
+    assert r.json()["paid_before_cents"] == 100000 and r.json()["payable_cents"] == 28160
+
+    # 可付额已为 0，任何正金额均被拒
+    assert pay(client, "P3", "A1", close_id, 1).status_code == 400
+
+    s = client.get("/authors/A1/settlement").json()
+    assert s["accrued_cents"] == 128160 and s["paid_cents"] == 128160
+    assert s["payable_cents"] == 0 and s["negative_balance_cents"] == 0
+    assert [p["payment_id"] for p in s["payments"]] == ["P1", "P2"]
+    assert client.get("/payments/P1").json() == body
+
+
+def test_payment_validation_errors(client):
+    # 作者不存在 → 404
+    assert pay(client, "P1", "NOBODY", 99, 100).status_code == 404
+    make_work(client)
+    client.post("/closes", json={"request_id": "C1"})
+    # 批次不存在 → 404
+    assert pay(client, "P1", "A1", 999, 100).status_code == 404
+    # 再关一批，旧批次不再是当前最新 → 409
+    client.post("/closes", json={"request_id": "C2"})
+    assert pay(client, "P1", "A1", 1, 100).status_code == 409
+    # 当前最新批次该作者应计为 0 → 可付额 0，正金额 → 400
+    assert pay(client, "P1", "A1", 2, 100).status_code == 400
+    # 金额非正 → 422（请求体校验）
+    assert pay(client, "P2", "A1", 2, 0).status_code == 422
+
+
+def test_payment_negative_balance_recovered_by_later_close(client):
+    make_work(client)
+    # 100 册 ×33.33×8% = 每册 267 分 → 26700；A1 60% = 16020
+    make_sale(client, "S1", copies=100)
+    c1 = client.post("/closes", json={"request_id": "C1"}).json()["close_id"]
+    assert pay(client, "P1", "A1", c1, 16020).status_code == 201
+
+    # 关账后全额退款 26700（A1 -16020），再关账
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 100})
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()["close_id"]
+
+    s = client.get("/authors/A1/settlement").json()
+    assert s["accrued_cents"] == 0 and s["paid_cents"] == 16020
+    assert s["negative_balance_cents"] == 16020 and s["payable_cents"] == 0
+    assert [(b["close_id"], b["batch_net_cents"], b["accrued_cents"]) for b in s["batches"]] == [
+        (c1, 16020, 16020),
+        (c2, -16020, 0),
+    ]
+    # 负余额时拒绝任何付款
+    assert pay(client, "P2", "A1", c2, 1).status_code == 400
+
+    # 后续关账的正额先抵扣：300 册全部在 8% 档 → 80100；A1 48060
+    make_sale(client, "S2", copies=300)
+    c3 = client.post("/closes", json={"request_id": "C3"}).json()["close_id"]
+    s = client.get("/authors/A1/settlement").json()
+    assert s["accrued_cents"] == 48060 and s["paid_cents"] == 16020
+    assert s["negative_balance_cents"] == 0 and s["payable_cents"] == 32040
+    assert pay(client, "P3", "A1", c3, 32040).status_code == 201
+
+    # 旧报表与旧付款均未被改写；旧付款重放返回原始结算
+    assert client.get(f"/closes/{c1}").json()["author_totals"][0]["amount_cents"] == 16020
+    old = client.get("/payments/P1").json()
+    assert old["close_id"] == c1 and old["accrued_cents"] == 16020
+    assert pay(client, "P1", "A1", c1, 16020).json() == old
+
+
+def test_payment_replay_after_new_close_and_conflict(client):
+    make_work(client)
+    make_sale(client, "S1", copies=800)  # A1 128160
+    c1 = client.post("/closes", json={"request_id": "C1"}).json()["close_id"]
+    body = pay(client, "P1", "A1", c1, 100000).json()
+
+    # 之后又关账（空批），原批次已不是最新
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()["close_id"]
+    # 同号同内容重放仍返回原结算结果（不校验最新批次）
+    r = pay(client, "P1", "A1", c1, 100000)
+    assert r.status_code == 200 and r.json() == body
+    # 同号异内容（金额/批次）→ 409
+    assert pay(client, "P1", "A1", c1, 100001).status_code == 409
+    assert pay(client, "P1", "A1", c2, 100000).status_code == 409
+    # 新批次上可结算剩余可付额
+    assert pay(client, "P2", "A1", c2, 28160).status_code == 201
+    assert pay(client, "P3", "A1", c2, 1).status_code == 400
+
+
+def test_concurrent_payments_never_overpay(client):
+    make_work(
+        client,
+        tiers=[{"threshold": 0, "rate": 0.08}],
+        authors=[{"author_id": "A1", "ratio": 60}, {"author_id": "A2", "ratio": 40}],
+    )
+    make_sale(client, "S1", copies=20, price="10.00")  # 20×80=1600；A1=960
+    close_id = client.post("/closes").json()["close_id"]
+
+    def do_pay(i):
+        return pay(client, f"CP{i}", "A1", close_id, 50)  # 20×50=1000 > 可付 960
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(do_pay, range(20)))
+    assert sum(1 for r in results if r.status_code == 201) == 19  # 19×50=950
+    assert sum(1 for r in results if r.status_code == 400) == 1
+    s = client.get("/authors/A1/settlement").json()
+    assert s["paid_cents"] == 950 and s["payable_cents"] == 10
+    assert pay(client, "CPX", "A1", close_id, 10).status_code == 201
+    assert pay(client, "CPY", "A1", close_id, 1).status_code == 400
+
+
+def test_payment_and_author_edge_cases(client):
+    assert client.get("/payments/NOPE").status_code == 404
+    make_work(client)
+    # 作者存在但从未关账
+    s = client.get("/authors/A1/settlement").json()
+    assert s["latest_close_id"] is None
+    assert s["accrued_cents"] == 0 and s["paid_cents"] == 0
+    assert s["negative_balance_cents"] == 0 and s["payable_cents"] == 0
+    assert s["batches"] == [] and s["payments"] == []
+    assert client.get("/authors/NOBODY/settlement").status_code == 404

@@ -53,3 +53,27 @@ curl -s -X POST "$BASE/sales" -H 'Content-Type: application/json' -d '{
 echo "== 6. 再次关账并查看两批报表 =="
 curl -s -X POST "$BASE/closes" | fmt
 curl -s "$BASE/closes" | fmt
+
+echo "== 7. 财务确认作者付款（针对当前最新批次，即第 2 批）=="
+LATEST_CLOSE=$(curl -s "$BASE/authors/A1/settlement" | python3 -c 'import sys,json; print(json.load(sys.stdin)["latest_close_id"])')
+echo "当前最新关账批次：$LATEST_CLOSE"
+# A1 第1批净额 = 200160（销售）- 47970（退款冲回）= 152190
+# A1 第2批净额 = 5 册×200 分(10% 档)×60% = 600；可付额 = 152190 + 600 = 152790 分
+curl -s -X POST "$BASE/payments" -H 'Content-Type: application/json' -d "{
+  \"payment_id\": \"PAY-2026-09-A1\",
+  \"author_id\": \"A1\",
+  \"close_id\": $LATEST_CLOSE,
+  \"amount_cents\": 100000
+}" | fmt
+
+echo "== 8. 同付款编号同内容重试（返回原结算结果，即使之后再关账也不变）=="
+curl -s -X POST "$BASE/payments" -H 'Content-Type: application/json' -d "{
+  \"payment_id\": \"PAY-2026-09-A1\",
+  \"author_id\": \"A1\",
+  \"close_id\": $LATEST_CLOSE,
+  \"amount_cents\": 100000
+}" | fmt
+
+echo "== 9. 按作者查询：分批应计/已付/负余额/可付额/付款记录 =="
+curl -s "$BASE/authors/A1/settlement" | fmt
+curl -s "$BASE/payments/PAY-2026-09-A1" | fmt

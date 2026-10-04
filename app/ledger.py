@@ -9,6 +9,16 @@
 - 关账汇总上一批次之后到本次提交前的全部流水，生成逐笔明细与作者合计的快照报表，
   报表落库后不可修改；关账后补录的旧业务流水按入账序号自然进入下一批次；
 - 同号同内容重试返回原结果，同号异内容拒绝（409）。
+
+付款结算（关账后）：
+- 以作者编号、当前最新关账批次编号、付款编号、支付金额（分）提交；
+- 应计额 = 截至该批次全部不可改关账快照中该作者净额之和；
+- 已付额 = 该作者全部已确认付款之和；可付额 = max(应计额 - 已付额, 0)；
+- 关账后退款若使应计额低于已付额，差额为待抵扣负余额，后续关账的正额先抵扣，
+  旧报表与旧付款均不改写；
+- 支付金额必须为正且不超过可付额；作者/批次不存在、批次非当前最新一律拒绝；
+- 同付款编号同内容重试返回原结算结果（即使之后又有关账），异内容拒绝（409）；
+- 全部结算写操作在同一全局锁与单事务内完成，并发结算不会超付。
 """
 from __future__ import annotations
 
@@ -19,7 +29,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from .db import LOCK, get_conn
-from .schemas import RefundIn, SaleIn, WorkIn
+from .schemas import PaymentIn, RefundIn, SaleIn, WorkIn
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal(100)
@@ -618,4 +628,192 @@ def list_closes() -> dict:
                 }
                 for r in rows
             ]
+        }
+
+
+# ---------------------------------------------------------------- 付款结算
+
+
+def _author_exists(conn: sqlite3.Connection, author_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM work_authors WHERE author_id=? LIMIT 1", (author_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _latest_close_id(conn: sqlite3.Connection) -> int | None:
+    r = conn.execute("SELECT MAX(close_id) AS c FROM closes").fetchone()
+    return r["c"]
+
+
+def _accrued_cents(conn: sqlite3.Connection, author_id: str, through_close_id: int) -> int:
+    """截至指定批次，所有不可改关账快照中该作者净额之和。"""
+    r = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS c FROM close_author_totals"
+        " WHERE author_id=? AND close_id<=?",
+        (author_id, through_close_id),
+    ).fetchone()
+    return r["c"]
+
+
+def _paid_cents(conn: sqlite3.Connection, author_id: str) -> int:
+    r = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS c FROM payments WHERE author_id=?",
+        (author_id,),
+    ).fetchone()
+    return r["c"]
+
+
+def _payment_fingerprint(p: PaymentIn) -> str:
+    return _fingerprint(
+        {
+            "payment_id": p.payment_id,
+            "author_id": p.author_id,
+            "close_id": p.close_id,
+            "amount_cents": p.amount_cents,
+        }
+    )
+
+
+def _payment_response_from_row(row: sqlite3.Row) -> dict:
+    accrued = row["accrued_cents"]
+    paid_after = row["paid_before_cents"] + row["amount_cents"]
+    return {
+        "payment_id": row["payment_id"],
+        "author_id": row["author_id"],
+        "close_id": row["close_id"],
+        "amount_cents": row["amount_cents"],
+        "accrued_cents": accrued,
+        "paid_before_cents": row["paid_before_cents"],
+        "payable_cents": row["payable_cents"],
+        "paid_after_cents": paid_after,
+        "negative_balance_cents": max(paid_after - accrued, 0),
+        "created_at": row["created_at"],
+    }
+
+
+def submit_payment(p: PaymentIn) -> tuple[dict, bool]:
+    """提交作者付款结算。返回 (结算结果, 是否新建)。"""
+    fp = _payment_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        # 幂等优先：同付款编号同内容即使批次已不再是最新，也返回原结算结果
+        row = conn.execute(
+            "SELECT * FROM payments WHERE payment_id=?", (p.payment_id,)
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fp:
+                raise _conflict(f"付款编号 {p.payment_id} 已存在且内容不一致")
+            return _payment_response_from_row(row), False
+        if not _author_exists(conn, p.author_id):
+            raise _not_found(f"作者 {p.author_id} 不存在")
+        if conn.execute(
+            "SELECT 1 FROM closes WHERE close_id=?", (p.close_id,)
+        ).fetchone() is None:
+            raise _not_found(f"关账批次 {p.close_id} 不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            latest = _latest_close_id(conn)
+            if p.close_id != latest:
+                raise _conflict(
+                    f"关账批次 {p.close_id} 不是当前最新批次（最新为 {latest}），拒绝结算"
+                )
+            accrued = _accrued_cents(conn, p.author_id, p.close_id)
+            paid_before = _paid_cents(conn, p.author_id)
+            payable = max(accrued - paid_before, 0)
+            if p.amount_cents > payable:
+                raise _bad_request(
+                    f"支付金额 {p.amount_cents} 分超过可付额 {payable} 分"
+                    f"（应计 {accrued} - 已付 {paid_before}）"
+                )
+            cur = conn.execute(
+                "INSERT INTO payments(payment_id, author_id, close_id, amount_cents,"
+                " accrued_cents, paid_before_cents, payable_cents, fingerprint, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    p.payment_id,
+                    p.author_id,
+                    p.close_id,
+                    p.amount_cents,
+                    accrued,
+                    paid_before,
+                    payable,
+                    fp,
+                    _utcnow(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM payments WHERE rowid=?", (cur.lastrowid,)
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _payment_response_from_row(row), True
+
+
+def get_payment(payment_id: str) -> dict:
+    with LOCK:
+        row = get_conn().execute(
+            "SELECT * FROM payments WHERE payment_id=?", (payment_id,)
+        ).fetchone()
+        if row is None:
+            raise _not_found(f"付款 {payment_id} 不存在")
+        return _payment_response_from_row(row)
+
+
+def author_settlement(author_id: str) -> dict:
+    """按作者查询：分批应计、累计应计、已付额、负余额、可付额及全部付款记录。"""
+    with LOCK:
+        conn = get_conn()
+        if not _author_exists(conn, author_id):
+            raise _not_found(f"作者 {author_id} 不存在")
+        batches = conn.execute(
+            "SELECT c.close_id, c.created_at, COALESCE(t.amount_cents,0) AS amount_cents"
+            " FROM closes c LEFT JOIN close_author_totals t"
+            " ON t.close_id=c.close_id AND t.author_id=?"
+            " ORDER BY c.close_id",
+            (author_id,),
+        ).fetchall()
+        per_batch = []
+        cumulative = 0
+        for b in batches:
+            cumulative += b["amount_cents"]
+            per_batch.append(
+                {
+                    "close_id": b["close_id"],
+                    "created_at": b["created_at"],
+                    "batch_net_cents": b["amount_cents"],
+                    "accrued_cents": cumulative,
+                }
+            )
+        paid = _paid_cents(conn, author_id)
+        latest = _latest_close_id(conn)
+        accrued = cumulative  # 截至最新批次的应计额；无批次时为 0
+        return {
+            "author_id": author_id,
+            "latest_close_id": latest,
+            "accrued_cents": accrued,
+            "paid_cents": paid,
+            "negative_balance_cents": max(paid - accrued, 0),
+            "payable_cents": max(accrued - paid, 0),
+            "batches": per_batch,
+            "payments": [
+                {
+                    "payment_id": r["payment_id"],
+                    "close_id": r["close_id"],
+                    "amount_cents": r["amount_cents"],
+                    "accrued_cents": r["accrued_cents"],
+                    "paid_before_cents": r["paid_before_cents"],
+                    "payable_cents": r["payable_cents"],
+                    "created_at": r["created_at"],
+                }
+                for r in conn.execute(
+                    "SELECT * FROM payments WHERE author_id=?"
+                    " ORDER BY created_at, payment_id",
+                    (author_id,),
+                )
+            ],
         }
